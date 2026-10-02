@@ -1,3 +1,4 @@
+# Copia este archivo a config.py y ajusta los valores
 #!/usr/bin/env python3
 """Config compartido por todos los scripts del pipeline Hyperliquid."""
 import sqlite3
