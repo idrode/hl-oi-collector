@@ -1,8 +1,7 @@
 # oi — pipeline de datos Hyperliquid
 
-Daemon en Python (Termux / Android ARM64, sin root) que ingesta datos de
-Hyperliquid en `hyperT-data/oidata.db` (SQLite WAL) y los sirve por HTTP para
-un widget.
+Daemon en Python (Termux / Android ARM64) que ingesta datos de
+Hyperliquid en `hyperT-data/oidata.db` (SQLite WAL) y los sirve por HTTP
 
 ## Procesos
 
