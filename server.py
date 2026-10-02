@@ -181,6 +181,9 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/health":
                 self._send_json(self._health(conn))
                 return
+            if path == "/coins":
+                self._send_json(list(COINS))
+                return
             if path == "/snapshot":
                 self._send_json(self._snapshot(conn))
                 return
