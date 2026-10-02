@@ -1,0 +1,13 @@
+*
+!.gitignore
+!LICENSE
+!README.md
+!config.example.py
+!oi_poller.py
+!trades_listener.py
+!book_listener.py
+!candles.py
+!funding_poller.py
+!cleanup.py
+!server.py
+!supervisor.sh
