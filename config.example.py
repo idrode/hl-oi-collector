@@ -117,6 +117,31 @@ ENDPOINT_MAX_LIMIT = {"/oi": 60_000, "/delta": 10_000, "/funding": 20_000,
 # ENDPOINT_MAX_LIMIT, que es lo que hacían /oi y /delta antes de esta tabla.
 ENDPOINT_DEFAULT_LIMIT = {"/whales": 100}
 
+# /candles se parametriza por INTERVALO, no solo por ruta: la densidad y la
+# retención van de 1m/14 d a 1h/180 d, así que una ventana única serviría
+# 20 160 filas en 1m y 720 en 1h. La clave compuesta "/candles:<interval>"
+# permite reusar _window() tal cual, sin tocar la ruta común de /oi y /delta.
+# Las ventanas por defecto son las mismas que candles.BACKFILL_WINDOW_MS: es
+# lo que el ingestor garantiza relleno tras un arranque en frío.
+CANDLE_DEFAULT_WINDOW_SECONDS = {
+    "1m": 6 * 3600, "5m": 86_400, "15m": 3 * 86_400, "1h": 30 * 86_400,
+}
+
+# Velas que caben en la ventana máxima (= retención del intervalo) más ~4 % de
+# holgura, porque cleanup corre una vez al día y puede haber algo más de N
+# días: 1m 14 d = 20 160, 5m 60 d = 17 280, 15m 180 d = 17 280, 1h 180 d =
+# 4 320. Medido sobre una copia con 1m a retención llena: 20 160 filas son
+# 2,1 MB de JSON y 110 ms, así que el LIMIT es el techo, no el caso normal.
+CANDLE_MAX_LIMIT = {"1m": 21_000, "5m": 18_000, "15m": 18_000, "1h": 4_500}
+
+ENDPOINT_DEFAULT_WINDOW_SECONDS.update(
+    {f"/candles:{iv}": s for iv, s in CANDLE_DEFAULT_WINDOW_SECONDS.items()})
+ENDPOINT_MAX_WINDOW_SECONDS.update(
+    {f"/candles:{iv}": CANDLE_RETENTION_DAYS[iv] * 86_400
+     for iv in CANDLE_INTERVALS})
+ENDPOINT_MAX_LIMIT.update(
+    {f"/candles:{iv}": n for iv, n in CANDLE_MAX_LIMIT.items()})
+
 # Hasta esta ventana /oi sirve los 5 s crudos de oi_snapshots; por encima, una
 # fila por minuto. 72 h crudas son 43 796 filas y ~4 MB de JSON por moneda,
 # pero es lo que HyperT necesita a 5 s.

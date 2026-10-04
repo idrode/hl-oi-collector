@@ -67,6 +67,17 @@ PORT = 8787
 #     "partial": true porque sigue recibiendo trades; los minutos ya cerrados
 #     no llevan el campo.
 #
+# /candles?coin=&interval=&since_ms=&limit=
+#     Ventana, máximo y LIMIT POR INTERVALO (config.CANDLE_*): 1m 6 h/14 d,
+#     5m 24 h/60 d, 15m 3 d/180 d, 1h 30 d/180 d. Cabecera extra
+#     X-Resolution: 1m | 5m | 15m | 1h.
+#     La vela ABIERTA lleva "partial": true. close_t es el cierre nominal
+#     INCLUSIVO (close_t - t == interval_ms - 1, comprobado sobre las 261 105
+#     velas de la base), asi que la vela abierta es la que cumple
+#     close_t >= now_ms: la unica a la que candles.py le sigue haciendo
+#     upsert. Solo puede ser la ultima fila, porque t es unico dentro de
+#     (coin, interval) y las filas van en orden ascendente.
+#
 # /health y /snapshot devuelven un OBJETO, no un array, y no admiten
 # parámetros. En /health, age_s puede salir ligeramente NEGATIVO (décimas de
 # segundo): los ts_ms vienen del exchange y el reloj del teléfono va algo por
@@ -211,17 +222,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._handle_whales(conn, qs)
                 return
             if path == "/candles":
-                coin = qs.get("coin", [None])[0]
-                interval = qs.get("interval", [None])[0]
-                since_ms = int(qs.get("since_ms", [0])[0])
-                if not coin or not interval:
-                    self._send_json({"error": "faltan ?coin= e ?interval="}, 400)
-                    return
-                rows = conn.execute(
-                    "SELECT t, close_t, o, h, l, c, v, n FROM candles "
-                    "WHERE coin = ? AND interval = ? AND t >= ? ORDER BY t ASC",
-                    (coin, interval, since_ms)).fetchall()
-                self._send_json(self._rows_to_json(rows))
+                self._handle_candles(conn, qs)
                 return
             self._send_json({"error": "ruta no encontrada"}, 404)
         except Exception as e:
@@ -293,6 +294,34 @@ class Handler(BaseHTTPRequestHandler):
             del r["id"]
         self._send_json(rows, headers=self._win_headers(
             rows, "ts_ms", since_ms, capada or hay_mas))
+
+    def _handle_candles(self, conn, qs):
+        coin = qs.get("coin", [None])[0]
+        if coin not in COINS_SET:
+            self._send_json({"error": "?coin= ausente o fuera de COINS"}, 400)
+            return
+        interval = qs.get("interval", [None])[0]
+        if interval not in CANDLE_INTERVALS:
+            self._send_json({"error": "?interval= ausente o no es uno de "
+                                      + ", ".join(CANDLE_INTERVALS)}, 400)
+            return
+        v = self._window_or_400(f"/candles:{interval}", qs)
+        if v is None:
+            return
+        since_ms, limit, now_ms, capada = v
+        rows, hay_mas = self._fetch_newest(conn,
+            "SELECT t, close_t, o, h, l, c, v, n FROM candles "
+            "WHERE coin = ? AND interval = ? AND t >= ?",
+            (coin, interval, since_ms), "t", limit)
+        # t forma el PK con (coin, interval): sin empates, el corte por valor
+        # de _fetch_newest cumple limit EXACTO (comprobado: limit=5000 devuelve
+        # 5000). No hace falta el recorte extra de /funding y /whales.
+        if rows and rows[-1]["close_t"] >= now_ms:
+            rows[-1]["partial"] = True
+        self._send_json(rows, headers={
+            **self._win_headers(rows, "t", since_ms, capada or hay_mas),
+            "X-Resolution": interval,
+        })
 
     def _handle_simple(self, conn, qs, sql):
         coin = qs.get("coin", [None])[0]
