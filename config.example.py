@@ -91,16 +91,31 @@ HEALTH_STATUS_EXCLUDE_TABLES = frozenset(("whale_trades",))
 # defecto, y sin limit se usa el máximo del endpoint. since_ms=0 o anterior a
 # la ventana máxima se capa al inicio permitido, nunca sirve el histórico
 # completo. El capado conserva SIEMPRE las filas más recientes.
-ENDPOINT_DEFAULT_WINDOW_SECONDS = {"/oi": 6 * 3600, "/delta": 6 * 3600}
+ENDPOINT_DEFAULT_WINDOW_SECONDS = {"/oi": 6 * 3600, "/delta": 6 * 3600,
+                                   "/funding": 7 * 86_400, "/whales": 24 * 3600}
 
-# /oi: 30 d = RETENTION_DAYS["oi_1m"]. /delta: 30 d = RETENTION_DAYS["delta_buckets"].
-ENDPOINT_MAX_WINDOW_SECONDS = {"/oi": 30 * 86_400, "/delta": 30 * 86_400}
+# Cada máximo es la retención de la tabla que sirve el endpoint: /oi 30 d =
+# RETENTION_DAYS["oi_1m"], /delta 30 d = delta_buckets, /funding 90 d,
+# /whales 14 d.
+ENDPOINT_MAX_WINDOW_SECONDS = {
+    "/oi": 30 * 86_400, "/delta": 30 * 86_400,
+    "/funding": RETENTION_DAYS["funding_snapshots"] * 86_400,
+    "/whales": RETENTION_DAYS["whale_trades"] * 86_400,
+}
 
 # El máximo de /oi queda por encima de las ~44 000 filas que son 72 h a 5 s,
 # porque HyperT pide esa ventana entera en su backfill (su app.rs: OI_LOOKBACK_MS
 # = 72 h) y no sabe reintentar lo que le falte. /delta a 48 h, lo que pide ese
 # mismo cliente, son ~2 900 filas, muy por debajo de 10 000.
-ENDPOINT_MAX_LIMIT = {"/oi": 60_000, "/delta": 10_000}
+# /funding: 5 venues y ~8 filas/h por moneda (medido en audit.db) son ~17 000
+# filas en los 90 d de retención; 20 000 deja holgura sin abrir barridos.
+ENDPOINT_MAX_LIMIT = {"/oi": 60_000, "/delta": 10_000, "/funding": 20_000,
+                      "/whales": 10_000}
+
+# LIMIT cuando el cliente no manda ?limit=. Solo para los endpoints donde
+# servir el máximo por defecto no tiene sentido; el resto usa su
+# ENDPOINT_MAX_LIMIT, que es lo que hacían /oi y /delta antes de esta tabla.
+ENDPOINT_DEFAULT_LIMIT = {"/whales": 100}
 
 # Hasta esta ventana /oi sirve los 5 s crudos de oi_snapshots; por encima, una
 # fila por minuto. 72 h crudas son 43 796 filas y ~4 MB de JSON por moneda,

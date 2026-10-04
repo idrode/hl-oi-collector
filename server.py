@@ -12,7 +12,9 @@ import time
 from config import (
     CANDLE_INTERVALS,
     COINS,
+    COINS_SET,
     DB_PATH,
+    ENDPOINT_DEFAULT_LIMIT,
     ENDPOINT_DEFAULT_WINDOW_SECONDS,
     ENDPOINT_MAX_LIMIT,
     ENDPOINT_MAX_WINDOW_SECONDS,
@@ -141,7 +143,10 @@ class Handler(BaseHTTPRequestHandler):
                 since_ms = mas_viejo
         max_limit = ENDPOINT_MAX_LIMIT[path]
         lim = qs.get("limit", [None])[0]
-        limit = max_limit if lim is None else max(1, min(int(lim), max_limit))
+        if lim is None:
+            limit = ENDPOINT_DEFAULT_LIMIT.get(path, max_limit)
+        else:
+            limit = max(1, min(int(lim), max_limit))
         return since_ms, limit, now_ms, capada
 
     def _fetch_newest(self, conn, inner_sql, params, tcol, limit):
@@ -194,9 +199,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._handle_delta(conn, qs)
                 return
             if path == "/funding":
-                self._handle_simple(conn, qs,
-                    "SELECT ts_ms, venue, funding_rate, premium, next_funding_time, interval_hours "
-                    "FROM funding_snapshots WHERE coin = ? AND ts_ms >= ? ORDER BY ts_ms ASC")
+                self._handle_funding(conn, qs)
                 return
             if path == "/book":
                 self._handle_simple(conn, qs,
@@ -205,19 +208,7 @@ class Handler(BaseHTTPRequestHandler):
                     "FROM book_snapshots WHERE coin = ? AND ts_ms >= ? ORDER BY ts_ms ASC")
                 return
             if path == "/whales":
-                coin = qs.get("coin", [None])[0]
-                since_ms = int(qs.get("since_ms", [0])[0])
-                if coin:
-                    rows = conn.execute(
-                        "SELECT ts_ms, coin, side, px, sz, notional, buyer, seller, tx_hash, tid "
-                        "FROM whale_trades WHERE coin = ? AND ts_ms >= ? ORDER BY ts_ms ASC",
-                        (coin, since_ms)).fetchall()
-                else:
-                    rows = conn.execute(
-                        "SELECT ts_ms, coin, side, px, sz, notional, buyer, seller, tx_hash, tid "
-                        "FROM whale_trades WHERE ts_ms >= ? ORDER BY ts_ms ASC",
-                        (since_ms,)).fetchall()
-                self._send_json(self._rows_to_json(rows))
+                self._handle_whales(conn, qs)
                 return
             if path == "/candles":
                 coin = qs.get("coin", [None])[0]
@@ -237,6 +228,71 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json({"error": str(e)}, 500)
         finally:
             conn.close()
+
+    def _window_or_400(self, path, qs):
+        """Como _window, pero contesta 400 y devuelve None si since_ms o limit
+        no son enteros. Solo lo usan los endpoints nuevos: /oi y /delta siguen
+        dando 500 hasta el cambio #4."""
+        try:
+            return self._window(path, qs)
+        except ValueError:
+            self._send_json({"error": "since_ms y limit deben ser enteros"}, 400)
+            return None
+
+    def _handle_funding(self, conn, qs):
+        coin = qs.get("coin", [None])[0]
+        if coin not in COINS_SET:
+            self._send_json({"error": "?coin= ausente o fuera de COINS"}, 400)
+            return
+        v = self._window_or_400("/funding", qs)
+        if v is None:
+            return
+        since_ms, limit, _now_ms, capada = v
+        rows, hay_mas = self._fetch_newest(conn,
+            "SELECT ts_ms, venue, funding_rate, premium, next_funding_time, "
+            "interval_hours FROM funding_snapshots WHERE coin = ? AND ts_ms >= ?",
+            (coin, since_ms), "ts_ms", limit)
+        # ts_ms no es único aquí: cada venue aporta una fila por instante. El
+        # corte por valor de _fetch_newest puede devolver hasta n_venues - 1
+        # filas por encima de limit, y deja los empates en orden arbitrario;
+        # se reordena por (ts_ms, venue) para que la serie sea estable.
+        rows.sort(key=lambda r: (r["ts_ms"], r["venue"]))
+        self._send_json(rows, headers=self._win_headers(
+            rows, "ts_ms", since_ms, capada or hay_mas))
+
+    def _handle_whales(self, conn, qs):
+        coin = qs.get("coin", [None])[0]
+        if coin not in COINS_SET:
+            self._send_json({"error": "?coin= ausente o fuera de COINS"}, 400)
+            return
+        v = self._window_or_400("/whales", qs)
+        if v is None:
+            return
+        since_ms, limit, _now_ms, capada = v
+        # buyer, seller y tx_hash NO se sirven: son direcciones y hashes de
+        # cadena, y el servidor escucha en 0.0.0.0. trades_listener.py los
+        # sigue guardando; si algun dia hacen falta, van tras un parametro
+        # explicito, nunca por defecto.
+        rows, hay_mas = self._fetch_newest(conn,
+            "SELECT id, ts_ms, side, px, sz, notional "
+            "FROM whale_trades WHERE coin = ? AND ts_ms >= ?",
+            (coin, since_ms), "ts_ms", limit)
+        # Hasta 32 fills comparten ts_ms en una misma moneda (medido en
+        # audit.db: una orden grande barriendo el libro entra como muchos
+        # fills del mismo milisegundo), asi que el corte por valor de
+        # _fetch_newest puede desbordar limit de sobra. Se ordena por
+        # (ts_ms, id) -- el PK autoincremental, NOT NULL y monotonico con la
+        # ingesta; tid no sirve porque es nullable y su orden numerico no es
+        # temporal -- y se recortan las limit mas recientes, asi que aqui
+        # limit se cumple EXACTO, al contrario que en /funding.
+        rows.sort(key=lambda r: (r["ts_ms"], r["id"]))
+        if len(rows) > limit:
+            rows = rows[-limit:]
+            hay_mas = True
+        for r in rows:
+            del r["id"]
+        self._send_json(rows, headers=self._win_headers(
+            rows, "ts_ms", since_ms, capada or hay_mas))
 
     def _handle_simple(self, conn, qs, sql):
         coin = qs.get("coin", [None])[0]
