@@ -11,3 +11,4 @@
 !cleanup.py
 !server.py
 !supervisor.sh
+!schema.sql
