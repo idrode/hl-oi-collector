@@ -33,78 +33,290 @@ PORT = 8787
 # ---------------------------------------------------------------------------
 # CONTRATO DE ENDPOINTS
 #
-# Todos los endpoints de serie temporal devuelven un ARRAY JSON de objetos en
-# orden ascendente de tiempo. Los metadatos van en CABECERAS, nunca dentro del
-# cuerpo, para no cambiar la forma de la respuesta:
-#   X-Window-Start-Ms  inicio real de la ventana servida: el ts de la primera
-#                      fila devuelta, o el since_ms ya capado si no hay filas.
-#   X-Truncated: true  presente solo si se recortó algo, por ventana o por
-#                      LIMIT. El recorte es SILENCIOSO: siempre 200, nunca 400.
+# Todo lo que sigue sale del codigo de este fichero y de config.py. Si cambia
+# una constante, cambia tambien esta cabecera.
 #
-# Reglas comunes (constantes en config.py):
-#   - Falta since_ms  → se usa ENDPOINT_DEFAULT_WINDOW_SECONDS del endpoint.
-#   - since_ms=0 o anterior a ENDPOINT_MAX_WINDOW_SECONDS → se capa al inicio
-#     permitido. Nunca sirve el histórico completo.
-#   - Falta limit     → se usa ENDPOINT_MAX_LIMIT del endpoint. Un limit mayor
-#     que ese máximo se recorta en silencio; menor se respeta tal cual.
-#   - Al capar se conservan las filas MÁS RECIENTES, en el mismo orden
-#     ascendente de siempre.
+# --- Transporte ------------------------------------------------------------
+# Solo GET; cualquier otro metodo lo rechaza BaseHTTPRequestHandler con 501.
+# Toda respuesta, errores incluidos, lleva Content-Type: application/json,
+# Content-Length y Access-Control-Allow-Origin: *.
+# Ruta desconocida  -> 404 {"error": "ruta no encontrada"}
+# Excepcion no vista -> 500 {"error": "<str(excepcion)>"}
 #
-# /oi?coin=&since_ms=&limit=       por defecto 6 h   máx 30 d   LIMIT 60 000
-#     ventana ≤ 72 h → oi_snapshots, resolución 5 s (es lo que pide el backfill
-#                      de HyperT, que no sabe reintentar lo que le falte).
-#     ventana > 72 h → una fila por minuto: oi_snapshots agregado al último
-#                      valor del minuto para el tramo reciente, y oi_1m para el
-#                      anterior a OI_DOWNSAMPLE_AFTER_DAYS (3 d). Misma
-#                      semántica que cleanup.downsample_oi, así que los dos
-#                      tramos empalman sin costura.
-#     oi_1m es SOLO histórico: nada lo escribe en vivo, lo rellena cleanup.py
-#     al pasar los 3 d, así que las ventanas cortas nunca salen de ahí.
-#     Cabecera extra X-Resolution: 5s | 1m.
+# --- Dos formas de respuesta ----------------------------------------------
+# ARRAY de objetos, orden ASCENDENTE de tiempo, con cabeceras de ventana:
+#   /oi  /delta  /funding  /whales  /candles  /book
+# OBJETO, sin ventana ni cabeceras:  /health  /snapshot  /book/last
+# ARRAY de strings:                  /coins
 #
-# /delta?coin=&since_ms=&limit=    por defecto 6 h   máx 30 d   LIMIT 10 000
-#     delta_buckets, un bucket por minuto. El bucket del minuto EN CURSO lleva
-#     "partial": true porque sigue recibiendo trades; los minutos ya cerrados
-#     no llevan el campo.
+# Los metadatos van en CABECERAS, nunca dentro del cuerpo, para no cambiar la
+# forma de la respuesta:
+#   X-Window-Start-Ms  SIEMPRE en los seis endpoints de array, incluso con 0
+#                      filas. Es el ts de la primera fila devuelta, o el
+#                      since_ms ya capado si no hay filas.
+#   X-Truncated: true  SOLO si se recorto algo. Significa "la ventana que te
+#                      sirvo es mas corta que la que pediste": o since_ms
+#                      caia antes del maximo permitido, o el LIMIT dejo fuera
+#                      filas mas antiguas que SI estaban en la ventana. El
+#                      cliente que la vea y quiera mas historico debe repetir
+#                      con since_ms mas reciente o limit mayor. El recorte es
+#                      SILENCIOSO: siempre 200, nunca 400.
+#   X-Resolution       solo /oi (5s | 1m) y /candles (1m | 5m | 15m | 1h).
 #
-# /candles?coin=&interval=&since_ms=&limit=
-#     Ventana, máximo y LIMIT POR INTERVALO (config.CANDLE_*): 1m 6 h/14 d,
-#     5m 24 h/60 d, 15m 3 d/180 d, 1h 30 d/180 d. Cabecera extra
-#     X-Resolution: 1m | 5m | 15m | 1h.
-#     La vela ABIERTA lleva "partial": true. close_t es el cierre nominal
-#     INCLUSIVO (close_t - t == interval_ms - 1, comprobado sobre las 261 105
-#     velas de la base), asi que la vela abierta es la que cumple
-#     close_t >= now_ms: la unica a la que candles.py le sigue haciendo
-#     upsert. Solo puede ser la ultima fila, porque t es unico dentro de
-#     (coin, interval) y las filas van en orden ascendente.
+# --- Ventana y LIMIT (_window, constantes en config.py) -------------------
+#   - Falta since_ms -> now - ENDPOINT_DEFAULT_WINDOW_SECONDS[endpoint].
+#   - since_ms anterior a now - ENDPOINT_MAX_WINDOW_SECONDS -> se capa a ese
+#     inicio y se marca X-Truncated. since_ms=0 (o negativo, o cualquier
+#     epoch viejo) lo dispara SIEMPRE: NUNCA se sirve el historico completo.
+#     Es deliberado, no un limite de paginacion.
+#   - since_ms en el futuro se acepta tal cual: [] y sin X-Truncated.
+#   - Falta limit -> ENDPOINT_DEFAULT_LIMIT si el endpoint tiene entrada, y
+#     si no, su ENDPOINT_MAX_LIMIT. Hoy solo /whales (100) y /book (1 000)
+#     tienen un defecto distinto del maximo.
+#   - limit mayor que el maximo se recorta en silencio; limit < 1 se sube a 1;
+#     un limit menor que el maximo se respeta tal cual.
+#   - Al capar se conservan las filas MAS RECIENTES (_fetch_newest), en el
+#     mismo orden ascendente de siempre.
+#   - since_ms y limit se parsean con int(): "abc", "1.5" y "" son invalidos.
+#     /funding /whales /candles /book -> 400 {"error": "since_ms y limit
+#     deben ser enteros"} (_window_or_400). /oi y /delta NO estan migrados y
+#     sueltan 500 con el texto del ValueError: legado, pendiente del cambio 4.
 #
-# /book?coin=&since_ms=&limit=      por defecto 6 h   máx 1 d   LIMIT 1 000
-#     book_snapshots, una fila cada BOOK_FLUSH_SECONDS (5 s). El LIMIT por
-#     defecto es 1 000, NO el máximo de 18 000: 6 h son 3 959 filas, así que la
-#     peticion por defecto sirve las 1 000 mas recientes (~83 min) con
-#     X-Truncated: true; para la ventana entera hay que pedir ?limit= mayor.
-#     Antes no tenia ventana ni LIMIT y since_ms=0 servia 18 414 filas/6,4 MB.
-#     ts_ms viene REPETIDO en la tabla: book_snapshots no tiene UNIQUE y el
-#     listener reinserta la misma marca (2 646 grupos de 552 421 filas, 0,48 %,
-#     siempre en PARES y con payload IDENTICO). El endpoint deduplica con
-#     GROUP BY ts_ms quedandose con la fila de id mayor, asi que ts_ms es unico
-#     en la respuesta y el LIMIT se cumple EXACTO. Sin ese GROUP BY el corte
-#     por valor desborda: con el empate de ADA, limit=4 devuelve 5 filas.
-#     El id interno NO se sirve. Arreglar la tabla es Fase 2 (#8).
+#   endpoint        ventana def.  ventana max.  LIMIT def.  LIMIT max.
+#   /oi                    6 h          30 d      60 000     60 000
+#   /delta                 6 h          30 d      10 000     10 000
+#   /funding               7 d          90 d      20 000     20 000
+#   /whales               24 h          14 d         100     10 000
+#   /book                  6 h           1 d       1 000     18 000
+#   /candles 1m            6 h          14 d      21 000     21 000
+#   /candles 5m           24 h          60 d      18 000     18 000
+#   /candles 15m           3 d         180 d      18 000     18 000
+#   /candles 1h           30 d         180 d       4 500      4 500
+#   Cada ventana maxima es la retencion de la tabla que sirve el endpoint.
+#   /candles se parametriza por INTERVALO con la clave "/candles:<interval>".
 #
-# /book/last?coin=
-#     Un OBJETO con la ultima fila de la moneda, o {} si no hay ninguna. Un
-#     solo seek por idx_book_coin_ts (medido 0,014-0,2 ms). Sin ventana, sin
-#     LIMIT y sin cabeceras de ventana. No necesita dedup: ORDER BY ts_ms DESC
-#     LIMIT 1 ya da una fila, y los duplicados traen el mismo payload.
-#     Su ts_ms viene del EXCHANGE, no del reloj del telefono, asi que puede
-#     quedar unas decimas por delante del "ahora" del cliente (misma causa que
-#     el age_s negativo de /health, que se deja como esta).
+# --- /oi?coin=&since_ms=&limit= -------------------------------------------
+# coin: string obligatorio. since_ms, limit: enteros opcionales.
+# Falta coin -> 400 {"error": "falta ?coin=XXX"}. NO valida contra COINS: una
+# moneda desconocida da 200 [] (legado, ver mas abajo).
+# Campos de salida en los dos tramos: ts_ms, oi, oi_notional, mark_px,
+# funding. No sale ningun id.
+#   ventana <= OI_RAW_WINDOW_SECONDS + OI_RAW_WINDOW_GRACE_SECONDS
+#   (72 h + 300 s) -> oi_snapshots crudo a 5 s. X-Resolution: 5s.
+#   ventana mayor  -> una fila por minuto. X-Resolution: 1m, con ts_ms
+#   SIEMPRE redondeado al minuto.
+# Costura de los 3 dias: frontera = ((now - OI_DOWNSAMPLE_AFTER_DAYS * 86 400
+# * 1000) // 60 000) * 60 000, es decir ALINEADA al minuto para que cada
+# minuto caiga en UN solo tramo. Sin alinear, el minuto partido por la
+# frontera saldria dos veces, una desde oi_1m y otra desde el agregado, justo
+# tras una pasada de cleanup.
+#   tramo >= frontera: oi_snapshots agregado con GROUP BY ts_ms / 60000 y
+#     MAX(ts_ms), o sea los valores del ULTIMO tick del minuto; misma
+#     semantica que cleanup.downsample_oi, asi que los dos tramos empalman sin
+#     costura. El redondeo al minuto se hace en Python, no en SQL, para no
+#     romper la semantica de columnas desnudas de MAX(). Los valores no se
+#     tocan.
+#   tramo <  frontera: oi_1m (minute_ms AS ts_ms). Solo se consulta si el
+#     tramo reciente no agoto el LIMIT: al capar manda lo mas nuevo.
+# oi_1m es SOLO historico, de 3 a 30 dias: nada lo escribe en vivo, lo rellena
+# cleanup.py al pasar OI_DOWNSAMPLE_AFTER_DAYS, asi que NO sirve para ventanas
+# recientes y una ventana corta nunca sale de ahi. Por eso la ventana maxima
+# de /oi es 30 d (retencion de oi_1m) aunque oi_snapshots solo guarde 3 d.
+# La resolucion la decide la ventana PEDIDA medida con el reloj del servidor,
+# no los datos que haya en la base. Los 300 s de gracia existen porque el
+# cliente calcula since_ms con SU reloj: una peticion de "justo 72 h" llega
+# midiendo algo mas (latencia + desfase) y sin margen caeria del lado
+# agregado. HyperT pide OI_LOOKBACK_MS = 72 h a 5 s y no sabe reintentar
+# huecos.
 #
-# /health y /snapshot devuelven un OBJETO, no un array, y no admiten
-# parámetros. En /health, age_s puede salir ligeramente NEGATIVO (décimas de
-# segundo): los ts_ms vienen del exchange y el reloj del teléfono va algo por
-# detrás, así que un cliente no debe asumir age_s >= 0.
+# --- /delta?coin=&since_ms=&limit= ----------------------------------------
+# Misma validacion legada de coin que /oi (falta -> 400 "falta ?coin=XXX";
+# desconocida -> 200 []). Sin X-Resolution.
+# delta_buckets, un bucket por minuto. Campos: minute_ms, buy_vol, sell_vol.
+# "partial": true SOLO en el bucket del minuto EN CURSO, el que cumple
+# minute_ms == (now_ms // 60 000) * 60 000, porque sigue recibiendo trades.
+# Los minutos ya cerrados NO llevan el campo (ausente, no false), y solo la
+# ultima fila puede llevarlo.
+#
+# --- /funding?coin=&since_ms=&limit= --------------------------------------
+# coin obligatorio y DENTRO de COINS; si no -> 400 {"error": "?coin= ausente
+# o fuera de COINS"}.
+# funding_snapshots filtrada por ts_ms. Campos: ts_ms, venue, funding_rate,
+# premium, next_funding_time, interval_hours.
+# Orden (ts_ms, venue), reordenado en Python: ts_ms NO es unico, cada venue
+# aporta una fila por instante (hoy 5 en la base: BinPerp, BybitPerp, Hl,
+# HlHist, HlPerp). Por eso el corte por valor de _fetch_newest puede devolver
+# hasta n_venues - 1 filas POR ENCIMA de limit (hoy hasta 4). Es el UNICO
+# endpoint donde limit es aproximado.
+#
+# --- /whales?coin=&since_ms=&limit= ---------------------------------------
+# coin OBLIGATORIO y dentro de COINS (mismo 400 que /funding): no hay modo
+# "todas las monedas".
+# whale_trades. Campos servidos: ts_ms, side, px, sz, notional.
+# Omitidos A PROPOSITO: buyer, seller y tx_hash son direcciones y hashes de
+# cadena y el servidor escucha en 0.0.0.0 sin autenticacion; coin es
+# redundante porque va en la query; tid es nullable y su orden numerico no es
+# temporal. id se usa solo para ordenar y se BORRA antes de serializar.
+# Ningun campo id ni _id sale nunca por HTTP, en ningun endpoint.
+# trades_listener.py sigue guardando los campos de cadena: si algun dia hacen
+# falta, iran tras un parametro explicito, nunca por defecto.
+# Orden (ts_ms, id) -- el PK autoincremental, NOT NULL y monotonico con la
+# ingesta -- y recorte final a las limit mas recientes, asi que aqui limit se
+# cumple EXACTO. Hace falta porque hasta 32 fills comparten ts_ms en una
+# moneda (una orden grande barriendo el libro entra como muchos fills del
+# mismo milisegundo).
+# Umbral por moneda en config.WHALE_THRESHOLDS_USD (defecto 25 000 USD): sin
+# fills por encima del umbral no hay filas, y los huecos de minutos son
+# normales, no un fallo.
+#
+# --- /candles?coin=&interval=&since_ms=&limit= ----------------------------
+# coin dentro de COINS -> si no, 400 {"error": "?coin= ausente o fuera de
+# COINS"}. interval OBLIGATORIO y uno de 1m, 5m, 15m, 1h -> si no, 400
+# {"error": "?interval= ausente o no es uno de 1m, 5m, 15m, 1h"}.
+# Campos: t, close_t, o, h, l, c, v, n. X-Resolution: el interval pedido.
+# Ventana y LIMIT por intervalo (tabla de arriba). Las ventanas por defecto
+# son las mismas que candles.BACKFILL_WINDOW_MS: es lo que el ingestor
+# garantiza relleno tras un arranque en frio.
+# close_t es el cierre nominal INCLUSIVO: close_t - t == interval_ms - 1
+# (comprobado sobre las 261 105 velas de la base). NO es el ts del ultimo
+# trade de la vela.
+# "partial": true en la vela ABIERTA, definida como close_t >= now_ms: la
+# unica a la que candles.py le sigue haciendo upsert. Solo puede ser la ultima
+# fila, porque t es unico dentro de (coin, interval) y las filas van en orden
+# ascendente. Las cerradas no llevan el campo.
+# Como t forma el PK con (coin, interval) no hay empates, asi que el corte por
+# valor cumple limit EXACTO sin el recorte extra de /funding y /whales.
+#
+# --- /book?coin=&since_ms=&limit= -----------------------------------------
+# coin dentro de COINS (mismo 400 que /funding). Sin X-Resolution.
+# book_snapshots, una fila cada BOOK_FLUSH_SECONDS (5 s).
+# Campos (BOOK_COLS): ts_ms, bid_px, bid_sz, ask_px, ask_sz, mid_px,
+# spread_bps, bid_depth_05, ask_depth_05, bid_depth_2, ask_depth_2, imb_05,
+# imb_2.
+# El LIMIT por defecto es 1 000, NO el maximo de 18 000: 6 h son 3 959 filas,
+# asi que la peticion por defecto sirve las 1 000 mas recientes (~83 min) con
+# X-Truncated: true, y para la ventana entera hay que pedir ?limit= mayor.
+# Antes no tenia ventana ni LIMIT y since_ms=0 servia 18 414 filas / 6,4 MB.
+# DUPLICADOS, resueltos SIN tocar el esquema: ts_ms viene REPETIDO en la tabla
+# porque book_snapshots no tiene UNIQUE y el listener reinserta la misma marca
+# (2 646 grupos de 552 421 filas, 0,48 %, siempre en PARES y con payload
+# IDENTICO). El endpoint deduplica con GROUP BY ts_ms y MAX(id) AS _id: por la
+# semantica de columnas desnudas de SQLite salen las columnas de la fila del
+# id mayor. Asi ts_ms es unico en la respuesta y limit se cumple EXACTO; sin
+# ese GROUP BY el corte por valor desborda (con el empate de ADA, limit=4
+# devolvia 5 filas). Usa idx_book_coin_ts sin b-tree temporal: +22 ms en la
+# ventana maxima (158 -> 181 ms). _id se borra antes de serializar. Poner el
+# UNIQUE en la tabla es Fase 2 (#8).
+# ts_ms es la marca del EXCHANGE (book["time"]), no del telefono, asi que un
+# age_s calculado por el cliente puede salir ligeramente NEGATIVO (decimas de
+# segundo): el reloj del telefono va algo por detras. No asumir ts_ms <= now
+# local ni age_s >= 0. Misma causa que el age_s negativo de /health.
+#
+# --- /book/last?coin= -----------------------------------------------------
+# coin dentro de COINS (mismo 400 que /funding). Sin since_ms ni limit.
+# Un OBJETO con la ultima fila de la moneda y los mismos campos que /book, o
+# {} si no hay ninguna. Sin cabeceras de ventana ni X-Resolution.
+# Un solo seek por idx_book_coin_ts (medido 0,014-0,2 ms). No necesita dedup:
+# ORDER BY ts_ms DESC LIMIT 1 ya da una fila y los duplicados traen el mismo
+# payload. Mismo caveat del ts_ms del exchange que /book.
+#
+# --- /coins ---------------------------------------------------------------
+# Array de strings con config.COINS en ORDEN DE CONFIG, no alfabetico; hoy 30
+# monedas. Sin parametros. Es la lista que validan /funding, /whales,
+# /candles, /book y /book/last.
+#
+# --- /snapshot ------------------------------------------------------------
+# OBJETO con la ultima fila por moneda, via seek en (coin, ts) en vez de un
+# GROUP BY sobre la tabla entera. Sin parametros, sin ventana, sin cabeceras.
+# Solo monedas de config.COINS, y omite las que no tienen datos. Ninguna lista
+# lleva "partial", ni siquiera la vela abierta de candles. Claves:
+#   oi       [{coin, ts_ms, oi, oi_notional, mark_px, funding}]
+#   delta    [{coin, minute_ms, buy_vol, sell_vol}]
+#   book     [{coin, ts_ms, bid_px, ask_px, mid_px, spread_bps, imb_05,
+#             imb_2, bid_depth_2, ask_depth_2}]  SUBCONJUNTO de /book: no trae
+#             bid_sz, ask_sz, bid_depth_05 ni ask_depth_05.
+#   funding  [{coin, venue, ts_ms, funding_rate, next_funding_time,
+#             interval_hours}]  sin premium, al contrario que /funding. Es el
+#             unico que sigue con MAX() agrupado: el venue no esta en config,
+#             asi que no hay lista por la que hacer seeks.
+#   candles  [{coin, interval, t, close_t, o, h, l, c, v, n}] una por cada
+#             (coin, interval).
+#
+# --- /health --------------------------------------------------------------
+# OBJETO, sin parametros, y SIEMPRE 200, tambien en "stale":
+#   {status, now_ms, db_bytes, wal_bytes, warnings: [...], tables: {...}}
+# status es "ok" solo si TODAS las tablas que cuentan estan fresh y warnings
+# esta vacio; en cualquier otro caso "stale". No hay un tercer valor.
+# warnings: "DB>1073741824 bytes" si db_bytes > HEALTH_WARN_DB_BYTES (1 GB) y
+# "WAL>209715200 bytes" si wal_bytes > HEALTH_WARN_WAL_BYTES (200 MB). Los dos
+# tamaños salen 0 si el fichero no se puede medir.
+# tables trae una entrada por tabla de TIME_COLS, con la columna de tiempo que
+# mide la frescura: oi_snapshots ts_ms, oi_1m minute_ms, delta_buckets
+# minute_ms, funding_snapshots ingested_ms (NO ts_ms: la frescura mide cuando
+# lo escribimos nosotros, mientras que /funding filtra por el ts_ms del
+# venue), book_snapshots ts_ms, whale_trades ts_ms, candles t.
+#   con datos:  {last_write_ms, age_s, fresh, fresh_threshold_s,
+#                counts_for_status}
+#   tabla vacia:{last_write_ms: null, age_s: null, fresh: false,
+#                counts_for_status}  OJO: sin fresh_threshold_s.
+#   error:      {error: "<texto>"} y el status global pasa a "stale".
+# fresh = age_s < fresh_threshold_s. El umbral es
+# HEALTH_FRESH_SECONDS_DEFAULT = 300 s para todas menos oi_1m, que usa
+# HEALTH_FRESH_SECONDS_OI_1M = OI_DOWNSAMPLE_AFTER_DAYS * 86 400 +
+# CLEANUP_INTERVAL_SECONDS + 3 600 = 284 400 s (3 d + 6 h + 1 h), porque no se
+# escribe en vivo: solo cleanup.py lo rellena, asi que su fila mas reciente
+# envejece hasta esa cota.
+# counts_for_status es false SOLO para whale_trades
+# (HEALTH_STATUS_EXCLUDE_TABLES): lo escribe trades_listener por evento de
+# mercado y sin ballenas no hay filas (huecos de hasta 900 s medidos), asi que
+# no es señal de salud del daemon; delta_buckets lo escribe el MISMO proceso
+# cada minuto y ya lo cubre. Se sigue reportando, pero no decide status.
+# age_s puede salir ligeramente NEGATIVO (decimas de segundo): los ts_ms
+# vienen del exchange y el reloj del telefono va algo por detras, asi que un
+# cliente no debe asumir age_s >= 0.
+#
+# --- Legado: moneda desconocida -------------------------------------------
+# /oi y /delta solo comprueban que ?coin= este PRESENTE. Con una moneda que no
+# esta en COINS la consulta no encuentra filas y responden 200 [] con
+# X-Window-Start-Ms. /funding, /whales, /candles, /book y /book/last SI
+# validan contra COINS_SET y responden 400. La diferencia se mantiene a
+# proposito: HyperT consume /oi y /delta y un 400 nuevo le romperia el
+# backfill. Un cliente nuevo no debe intentar distinguir "moneda inexistente"
+# de "moneda sin datos aun" mirando el codigo de estado.
+#
+# --- Nota de despliegue ---------------------------------------------------
+# main() escucha en 0.0.0.0:8787, o sea TODAS las interfaces, y NO hay
+# autenticacion ni rate limit: cualquiera en la misma red puede pedir
+# cualquier endpoint. Access-Control-Allow-Origin: * lo abre ademas a
+# cualquier origen de navegador. Por eso /whales no sirve buyer, seller ni
+# tx_hash. Si esto sale del telefono, va detras de un proxy con auth.
+# La base se abre en mode=ro y con una conexion por hilo (ThreadingHTTPServer,
+# daemon_threads), asi que el servidor no puede escribir ni cambiar PRAGMAs de
+# la base que usan los pollers.
+# _handle_simple() es codigo muerto: do_GET no lo llama, queda de los /oi y
+# /delta antiguos y no forma parte del contrato.
+#
+# --- Medido 2026-10-05: aporta algo la banda de +-2 % en /book? -----------
+# Casi nada. book_listener.compute_row suma las DOS bandas recorriendo el
+# MISMO array levels del l2Book, asi que cuando todos los niveles que manda el
+# exchange caen dentro de +-0,5 % del mid resulta bid_depth_2 == bid_depth_05,
+# ask_depth_2 == ask_depth_05 e imb_2 == imb_05, identicos bit a bit.
+# Filas con alguna diferencia, sobre la retencion entera de 1 d
+# (17 026 filas por moneda, consulta de solo lectura en mode=ro):
+#   BTC     (liquida)    0 / 17 026
+#   LINK    (media)      0 / 17 026
+#   CASHCAT (iliquida)   3 / 17 026   = 0,018 %
+# Acotado a la ultima hora (667 filas por moneda) las tres dan 0, que es lo
+# que ya se habia visto en BTC.
+# Las 3 filas de CASHCAT son justo el caso que justifica dejar la banda: en
+# una de ellas el libro se vacio dentro de +-0,5 % (bid_depth_05 =
+# ask_depth_05 = 0,0, con lo que imb_05 cae al 0.0 del denominador cero,
+# indistinguible de un libro equilibrado) mientras +-2 % veia 104 388 /
+# 21 927 USD e imb_2 = +0,65.
+# Conclusion: en monedas liquidas las columnas _2 son redundantes y un cliente
+# puede ignorarlas; en libros finos imb_2 es la UNICA señal cuando imb_05
+# colapsa a 0.0. Se dejan como estan, porque mirando solo imb_05 no se puede
+# distinguir "equilibrado" de "banda vacia".
 # ---------------------------------------------------------------------------
 
 
