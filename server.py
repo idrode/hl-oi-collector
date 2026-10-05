@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
-"""HTTP :8787. /oi usa oi_snapshots (5 s) para los últimos
-OI_DOWNSAMPLE_AFTER_DAYS días y oi_1m para lo anterior, uniendo ambos
-tramos si el rango lo cruza. /health incluye tamaño de DB y WAL."""
+"""HTTP :8787. /oi elige la resolución por la LONGITUD de la ventana pedida,
+no por la antigüedad de los datos: una ventana de hasta OI_RAW_WINDOW_SECONDS
++ OI_RAW_WINDOW_GRACE_SECONDS se sirve de oi_snapshots a 5 s, y por encima se
+devuelve una fila por minuto, uniendo el agregado de oi_snapshots con oi_1m en
+la frontera de OI_DOWNSAMPLE_AFTER_DAYS. /health incluye tamaño de DB y WAL."""
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 import json
@@ -293,8 +295,6 @@ PORT = 8787
 # La base se abre en mode=ro y con una conexion por hilo (ThreadingHTTPServer,
 # daemon_threads), asi que el servidor no puede escribir ni cambiar PRAGMAs de
 # la base que usan los pollers.
-# _handle_simple() es codigo muerto: do_GET no lo llama, queda de los /oi y
-# /delta antiguos y no forma parte del contrato.
 #
 # --- Medido 2026-10-05: aporta algo la banda de +-2 % en /book? -----------
 # Casi nada. book_listener.compute_row suma las DOS bandas recorriendo el
@@ -380,8 +380,10 @@ class Handler(BaseHTTPRequestHandler):
         """Resuelve (since_ms, limit, now_ms, capada) para un endpoint.
 
         Ver el contrato en la cabecera del fichero. int() puede lanzar
-        ValueError con un parámetro basura; de momento lo recoge el except
-        genérico de do_GET y sale un 500 (el 400 llega en el cambio #4)."""
+        ValueError con un parámetro basura y aquí NO se captura: los endpoints
+        que quieren 400 pasan por _window_or_400, y los que llaman a este
+        método directamente (/oi y /delta) dejan que el ValueError llegue al
+        except genérico de do_GET y salga un 500."""
         now_ms = int(time.time() * 1000)
         mas_viejo = now_ms - ENDPOINT_MAX_WINDOW_SECONDS[path] * 1000
         crudo = qs.get("since_ms", [None])[0]
@@ -473,8 +475,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def _window_or_400(self, path, qs):
         """Como _window, pero contesta 400 y devuelve None si since_ms o limit
-        no son enteros. Solo lo usan los endpoints nuevos: /oi y /delta siguen
-        dando 500 hasta el cambio #4."""
+        no son enteros. Lo usan /funding, /whales, /candles y /book. /oi y
+        /delta no están migrados y siguen dando 500: son legado y HyperT los
+        consume, así que un 400 nuevo le rompería el backfill."""
         try:
             return self._window(path, qs)
         except ValueError:
@@ -598,15 +601,6 @@ class Handler(BaseHTTPRequestHandler):
             f"SELECT {BOOK_COLS} FROM book_snapshots WHERE coin = ? "
             "ORDER BY ts_ms DESC LIMIT 1", (coin,)).fetchone()
         self._send_json(dict(row) if row is not None else {})
-
-    def _handle_simple(self, conn, qs, sql):
-        coin = qs.get("coin", [None])[0]
-        since_ms = int(qs.get("since_ms", [0])[0])
-        if not coin:
-            self._send_json({"error": "falta ?coin=XXX"}, 400)
-            return
-        rows = conn.execute(sql, (coin, since_ms)).fetchall()
-        self._send_json(self._rows_to_json(rows))
 
     def _handle_delta(self, conn, qs):
         coin = qs.get("coin", [None])[0]
