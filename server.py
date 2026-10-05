@@ -78,6 +78,29 @@ PORT = 8787
 #     upsert. Solo puede ser la ultima fila, porque t es unico dentro de
 #     (coin, interval) y las filas van en orden ascendente.
 #
+# /book?coin=&since_ms=&limit=      por defecto 6 h   máx 1 d   LIMIT 1 000
+#     book_snapshots, una fila cada BOOK_FLUSH_SECONDS (5 s). El LIMIT por
+#     defecto es 1 000, NO el máximo de 18 000: 6 h son 3 959 filas, así que la
+#     peticion por defecto sirve las 1 000 mas recientes (~83 min) con
+#     X-Truncated: true; para la ventana entera hay que pedir ?limit= mayor.
+#     Antes no tenia ventana ni LIMIT y since_ms=0 servia 18 414 filas/6,4 MB.
+#     ts_ms viene REPETIDO en la tabla: book_snapshots no tiene UNIQUE y el
+#     listener reinserta la misma marca (2 646 grupos de 552 421 filas, 0,48 %,
+#     siempre en PARES y con payload IDENTICO). El endpoint deduplica con
+#     GROUP BY ts_ms quedandose con la fila de id mayor, asi que ts_ms es unico
+#     en la respuesta y el LIMIT se cumple EXACTO. Sin ese GROUP BY el corte
+#     por valor desborda: con el empate de ADA, limit=4 devuelve 5 filas.
+#     El id interno NO se sirve. Arreglar la tabla es Fase 2 (#8).
+#
+# /book/last?coin=
+#     Un OBJETO con la ultima fila de la moneda, o {} si no hay ninguna. Un
+#     solo seek por idx_book_coin_ts (medido 0,014-0,2 ms). Sin ventana, sin
+#     LIMIT y sin cabeceras de ventana. No necesita dedup: ORDER BY ts_ms DESC
+#     LIMIT 1 ya da una fila, y los duplicados traen el mismo payload.
+#     Su ts_ms viene del EXCHANGE, no del reloj del telefono, asi que puede
+#     quedar unas decimas por delante del "ahora" del cliente (misma causa que
+#     el age_s negativo de /health, que se deja como esta).
+#
 # /health y /snapshot devuelven un OBJETO, no un array, y no admiten
 # parámetros. En /health, age_s puede salir ligeramente NEGATIVO (décimas de
 # segundo): los ts_ms vienen del exchange y el reloj del teléfono va algo por
@@ -116,6 +139,12 @@ SEEK_BY_COIN = frozenset((
 ))
 # funding_snapshots queda fuera: idx_funding_ingested ya resuelve MAX() en un
 # seek. candles necesita (coin, interval) para usar su índice → caso aparte.
+
+# Columnas que sirve /book. El id autoincremental queda fuera a proposito: se
+# usa solo para deduplicar ts_ms repetidos y filtraria el volumen de ingesta.
+BOOK_COLS = ("ts_ms, bid_px, bid_sz, ask_px, ask_sz, mid_px, spread_bps, "
+             "bid_depth_05, ask_depth_05, bid_depth_2, ask_depth_2, "
+             "imb_05, imb_2")
 
 class Handler(BaseHTTPRequestHandler):
     def _send_json(self, data, status=200, headers=None):
@@ -213,10 +242,10 @@ class Handler(BaseHTTPRequestHandler):
                 self._handle_funding(conn, qs)
                 return
             if path == "/book":
-                self._handle_simple(conn, qs,
-                    "SELECT ts_ms, bid_px, bid_sz, ask_px, ask_sz, mid_px, spread_bps, "
-                    "bid_depth_05, ask_depth_05, bid_depth_2, ask_depth_2, imb_05, imb_2 "
-                    "FROM book_snapshots WHERE coin = ? AND ts_ms >= ? ORDER BY ts_ms ASC")
+                self._handle_book(conn, qs)
+                return
+            if path == "/book/last":
+                self._handle_book_last(conn, qs)
                 return
             if path == "/whales":
                 self._handle_whales(conn, qs)
@@ -322,6 +351,41 @@ class Handler(BaseHTTPRequestHandler):
             **self._win_headers(rows, "t", since_ms, capada or hay_mas),
             "X-Resolution": interval,
         })
+
+    def _handle_book(self, conn, qs):
+        coin = qs.get("coin", [None])[0]
+        if coin not in COINS_SET:
+            self._send_json({"error": "?coin= ausente o fuera de COINS"}, 400)
+            return
+        v = self._window_or_400("/book", qs)
+        if v is None:
+            return
+        since_ms, limit, _now_ms, capada = v
+        # GROUP BY ts_ms deduplica las reinserciones del listener quedandose
+        # con la fila de id mayor: con un agregado MAX() SQLite saca las
+        # columnas desnudas de la fila del maximo. Usa idx_book_coin_ts sin
+        # b-tree temporal, +22 ms en la ventana maxima (158 -> 181 ms).
+        rows, hay_mas = self._fetch_newest(conn,
+            f"SELECT {BOOK_COLS}, MAX(id) AS _id FROM book_snapshots "
+            "WHERE coin = ? AND ts_ms >= ? GROUP BY ts_ms",
+            (coin, since_ms), "ts_ms", limit)
+        # Deduplicado, ts_ms es unico dentro de la moneda, asi que el corte por
+        # valor de _fetch_newest cumple limit EXACTO y no hace falta el recorte
+        # extra de /funding y /whales.
+        for r in rows:
+            del r["_id"]
+        self._send_json(rows, headers=self._win_headers(
+            rows, "ts_ms", since_ms, capada or hay_mas))
+
+    def _handle_book_last(self, conn, qs):
+        coin = qs.get("coin", [None])[0]
+        if coin not in COINS_SET:
+            self._send_json({"error": "?coin= ausente o fuera de COINS"}, 400)
+            return
+        row = conn.execute(
+            f"SELECT {BOOK_COLS} FROM book_snapshots WHERE coin = ? "
+            "ORDER BY ts_ms DESC LIMIT 1", (coin,)).fetchone()
+        self._send_json(dict(row) if row is not None else {})
 
     def _handle_simple(self, conn, qs, sql):
         coin = qs.get("coin", [None])[0]

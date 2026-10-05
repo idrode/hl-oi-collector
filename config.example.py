@@ -92,15 +92,17 @@ HEALTH_STATUS_EXCLUDE_TABLES = frozenset(("whale_trades",))
 # la ventana máxima se capa al inicio permitido, nunca sirve el histórico
 # completo. El capado conserva SIEMPRE las filas más recientes.
 ENDPOINT_DEFAULT_WINDOW_SECONDS = {"/oi": 6 * 3600, "/delta": 6 * 3600,
-                                   "/funding": 7 * 86_400, "/whales": 24 * 3600}
+                                   "/funding": 7 * 86_400, "/whales": 24 * 3600,
+                                   "/book": 6 * 3600}
 
 # Cada máximo es la retención de la tabla que sirve el endpoint: /oi 30 d =
 # RETENTION_DAYS["oi_1m"], /delta 30 d = delta_buckets, /funding 90 d,
-# /whales 14 d.
+# /whales 14 d, /book 1 d.
 ENDPOINT_MAX_WINDOW_SECONDS = {
     "/oi": 30 * 86_400, "/delta": 30 * 86_400,
     "/funding": RETENTION_DAYS["funding_snapshots"] * 86_400,
     "/whales": RETENTION_DAYS["whale_trades"] * 86_400,
+    "/book": RETENTION_DAYS["book_snapshots"] * 86_400,
 }
 
 # El máximo de /oi queda por encima de las ~44 000 filas que son 72 h a 5 s,
@@ -109,13 +111,18 @@ ENDPOINT_MAX_WINDOW_SECONDS = {
 # mismo cliente, son ~2 900 filas, muy por debajo de 10 000.
 # /funding: 5 venues y ~8 filas/h por moneda (medido en audit.db) son ~17 000
 # filas en los 90 d de retención; 20 000 deja holgura sin abrir barridos.
+# /book: a BOOK_FLUSH_SECONDS (5 s) el día de retención son 17 280 filas por
+# moneda; 18 000 cubre el desfase del cleanup, que corre cada 6 h. Medido: ese
+# techo son 15 840 filas y 5,5 MB, así que es tope, no el caso normal.
 ENDPOINT_MAX_LIMIT = {"/oi": 60_000, "/delta": 10_000, "/funding": 20_000,
-                      "/whales": 10_000}
+                      "/whales": 10_000, "/book": 18_000}
 
 # LIMIT cuando el cliente no manda ?limit=. Solo para los endpoints donde
 # servir el máximo por defecto no tiene sentido; el resto usa su
 # ENDPOINT_MAX_LIMIT, que es lo que hacían /oi y /delta antes de esta tabla.
-ENDPOINT_DEFAULT_LIMIT = {"/whales": 100}
+# /book a 1 000 filas (~83 min a 5 s) deja la petición por defecto en 0,35 MB
+# en vez de los 1,37 MB que son las 6 h enteras.
+ENDPOINT_DEFAULT_LIMIT = {"/whales": 100, "/book": 1_000}
 
 # /candles se parametriza por INTERVALO, no solo por ruta: la densidad y la
 # retención van de 1m/14 d a 1h/180 d, así que una ventana única serviría
